@@ -58,7 +58,7 @@ def ai_market_comment(changes: list[float]) -> str:
 
 def generate_message():
     date_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M")
-    lines = [f"📊 美股行情推送 ({date_cn})"]
+    lines = [f"美股推送 ({date_cn})"]
 
     changes = []
 
