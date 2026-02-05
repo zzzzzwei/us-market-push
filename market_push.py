@@ -4,83 +4,130 @@ import requests
 from datetime import datetime
 import pytz
 
-# ========= Telegram 配置 =========
+# ========= Telegram =========
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-# GitHub 运行模式
 IS_MANUAL = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
-# ========= 指数配置 =========
+# ========= 时区 =========
+TZ_US = pytz.timezone("US/Eastern")
+TZ_CN = pytz.timezone("Asia/Shanghai")
+
+# ========= 指数 =========
 INDEXES = {
     "纳指": "^IXIC",
     "标普500": "^GSPC",
     "道琼斯": "^DJI"
 }
 
-# ========= 时区 =========
-TZ_US = pytz.timezone("US/Eastern")
-TZ_CN = pytz.timezone("Asia/Shanghai")
+# ========= 风控参数 =========
+LOOKBACK_HIGH_DAYS = 20
+DRAWDOWN_THRESHOLD = -3.0
+CONTINUOUS_DOWN_DAYS = 4
+
+# ========= 宏观指标 =========
+MACRO_INDEX = {
+    "VIX": "^VIX",
+    "10Y美债": "^TNX",
+    "美元指数": "DX-Y.NYB"
+}
 
 
 def is_us_market_closed():
-    """是否已过美股收盘时间（16:00 美东，自动夏/冬令时）"""
-    now_us = datetime.now(TZ_US)
-
-    if now_us.weekday() >= 5:
+    now = datetime.now(TZ_US)
+    if now.weekday() >= 5:
         return False
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return now >= close_time
 
-    close_time = now_us.replace(hour=16, minute=0, second=0, microsecond=0)
-    return now_us >= close_time
+
+def get_history(symbol, days=30):
+    return yf.Ticker(symbol).history(period=f"{days}d")["Close"].dropna()
 
 
-def get_change(symbol):
-    data = yf.Ticker(symbol).history(period="5d")
-    closes = data["Close"].dropna()
-
+def get_today_change(closes):
     if len(closes) < 2:
         return None
-
-    today, yesterday = closes.iloc[-1], closes.iloc[-2]
-    return round((today / yesterday - 1) * 100, 2)
+    return round((closes.iloc[-1] / closes.iloc[-2] - 1) * 100, 2)
 
 
-def ai_market_comment(changes: list[float]) -> str:
-    avg = sum(changes) / len(changes)
+def get_drawdown_from_high(closes, lookback=20):
+    recent = closes.iloc[-lookback:]
+    high = recent.max()
+    today = recent.iloc[-1]
+    return round((today / high - 1) * 100, 2)
 
-    if avg > 0.8:
-        return "🤖 AI解读：市场情绪偏多，风险偏好回升，科技与权重股表现积极。"
-    elif avg < -0.8:
-        return "🤖 AI解读：市场情绪偏空，资金趋于谨慎，短期波动可能加大。"
-    else:
-        return "🤖 AI解读：指数分化，市场处于震荡整理阶段，等待新的催化因素。"
+
+def count_continuous_down_days(closes):
+    count = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes.iloc[i] < closes.iloc[i - 1]:
+            count += 1
+        else:
+            break
+    return count
+
+
+def macro_risk_check():
+    risks = []
+
+    vix = get_history(MACRO_INDEX["VIX"], 5)
+    if vix.iloc[-1] > 20:
+        risks.append("😰 VIX 偏高")
+
+    tnx = get_history(MACRO_INDEX["10Y美债"], 5)
+    if tnx.iloc[-1] > tnx.iloc[-2]:
+        risks.append("📈 美债收益率上行")
+
+    dxy = get_history(MACRO_INDEX["美元指数"], 5)
+    if dxy.iloc[-1] > dxy.iloc[-2]:
+        risks.append("💵 美元走强")
+
+    return risks if len(risks) >= 2 else []
 
 
 def generate_message():
-    date_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M")
-    lines = [f"美股推送 ({date_cn})"]
+    now_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M")
+    lines = [f"📊 美股风险监控 ({now_cn})"]
 
-    changes = []
+    risk_lines = []
 
     for name, code in INDEXES.items():
-        change = get_change(code)
-        if change is None:
-            continue
+        closes = get_history(code)
+        today_change = get_today_change(closes)
 
-        changes.append(change)
-        emoji = "📈" if change > 0 else "📉"
-        sign = "+" if change > 0 else ""
-        lines.append(f"{emoji} {name}: {sign}{change}%")
+        emoji = "📈" if today_change > 0 else "📉"
+        sign = "+" if today_change > 0 else ""
+        lines.append(f"{emoji} {name}: {sign}{today_change}%")
 
-    if changes:
+        # === 回撤风险 ===
+        drawdown = get_drawdown_from_high(closes, LOOKBACK_HIGH_DAYS)
+        if drawdown <= DRAWDOWN_THRESHOLD and today_change < 0:
+            risk_lines.append(
+                f"⚠️ {name} 较 {LOOKBACK_HIGH_DAYS} 日高点回撤 {abs(drawdown)}%，且今日继续下跌"
+            )
+
+        # === 连续下跌 ===
+        down_days = count_continuous_down_days(closes)
+        if down_days >= CONTINUOUS_DOWN_DAYS:
+            risk_lines.append(
+                f"📉 {name} 已连续下跌 {down_days} 天"
+            )
+
+    # === 宏观风险 ===
+    macro_risks = macro_risk_check()
+    if macro_risks:
+        risk_lines.append("🌍 宏观风险共振：")
+        risk_lines.extend(macro_risks)
+
+    if risk_lines:
         lines.append("")
-        lines.append(ai_market_comment(changes))
-
-    lines.append("")
-    lines.append("🕓 美股收盘：美东 16:00（自动识别夏 / 冬令时）")
+        lines.append("🚨 风险提醒：")
+        lines.extend(risk_lines)
 
     if IS_MANUAL:
-        lines.append("⚙️ 本次为手动触发推送")
+        lines.append("")
+        lines.append("⚙️ 本次为手动触发")
 
     return "\n".join(lines)
 
@@ -97,19 +144,16 @@ def send_telegram(text):
 
 
 def main():
-    print("🕒 CN:", datetime.now(TZ_CN))
-    print("🕒 US:", datetime.now(TZ_US))
     print("🔁 手动执行:", IS_MANUAL)
 
     if not IS_MANUAL and not is_us_market_closed():
-        print("⏳ 非手动执行，且美股未收盘，跳过")
+        print("⏳ 未收盘，跳过")
         return
 
     msg = generate_message()
-    print("📨 推送内容：\n", msg)
-
+    print(msg)
     send_telegram(msg)
-    print("✅ 已推送到 Telegram")
+    print("✅ 已推送")
 
 
 if __name__ == "__main__":
