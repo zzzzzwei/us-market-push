@@ -88,7 +88,7 @@ def macro_risk_check():
 
 def generate_message():
     now_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M")
-    lines = [f"📊 美股风险监控 ({now_cn})"]
+    lines = [f"美股监控 ({now_cn})"]
 
     risk_lines = []
 
